@@ -1,28 +1,21 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends 
-
-ffmpeg 
-
-fonts-dejavu-core 
-
-nodejs 
-
-ca-certificates 
-
-curl 
-
-&& rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    fonts-dejavu-core \
+    nodejs \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir --upgrade pip yt-dlp faster-whisper
+RUN pip install --no-cache-dir --upgrade pip yt-dlp faster-whisper pytubefix
 
 COPY . /app
 
-RUN mkdir -p /tmp/clipforge_exports /tmp/clipforge_uploads /tmp/hf_cache && 
-
-chmod -R 777 /app /tmp/clipforge_exports /tmp/clipforge_uploads /tmp/hf_cache
+RUN mkdir -p /tmp/clipforge_exports /tmp/clipforge_uploads /tmp/hf_cache && \
+    chmod -R 777 /app /tmp/clipforge_exports /tmp/clipforge_uploads /tmp/hf_cache
 
 ENV PORT=7860
 ENV HOME=/tmp
