@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ClipForge Pro — Free, Unlimited OpusClip-Style AI Video Clipper
-Supports: YouTube, YouTube Live, Twitch, Kick, TikTok, X/Twitter, Instagram,
-Vimeo, direct MP4/MOV/WebM URLs, and local video file uploads.
+Scans the entire video automatically (Heatmap + Live Chat + Auto-Transcript)
+to find, score, and render the best 9:16 clips for TikTok, Reels, Shorts & iPhone.
 """
 
 import json
@@ -47,17 +47,66 @@ def format_ass_time(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def ytdlp_base_cmd(cookies_path: Path | None = None) -> list[str]:
+def ytdlp_base_cmd(cookies_path: Path | None = None, browser: str | None = None) -> list[str]:
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-check-certificates",
         "--geo-bypass",
         "--no-playlist",
-        "--extractor-args", "youtube:player_client=ios,android,web",
     ]
     if cookies_path and cookies_path.exists():
         cmd.extend(["--cookies", str(cookies_path)])
+    elif browser:
+        cmd.extend(["--cookies-from-browser", browser])
     return cmd
+
+
+def get_browser_candidates() -> list[str | None]:
+    # On local PC (no PORT env), try browser cookies automatically if default fails
+    if "PORT" not in os.environ:
+        return [None, "edge", "chrome", "firefox"]
+    return [None]
+
+
+def robust_ytdlp_download(url: str, start_hms: str, end_hms: str, out_mp4: Path, cookies_path: Path | None) -> None:
+    """Try clean yt-dlp strategies + local browser cookies + pytubefix fallback."""
+    last_err = "Could not download video"
+    for browser in get_browser_candidates():
+        for fmt in ["bv*+ba/b", "best[ext=mp4]/best"]:
+            if out_mp4.exists():
+                out_mp4.unlink()
+            cmd = ytdlp_base_cmd(cookies_path, browser) + [
+                "-f", fmt,
+                "--merge-output-format", "mp4",
+                "--download-sections", f"*{start_hms}-{end_hms}",
+                "-o", str(out_mp4),
+                url,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 1024:
+                return
+            if proc.stderr or proc.stdout:
+                last_err = (proc.stderr or proc.stdout).strip().splitlines()[-1]
+
+    # Fallback: pytubefix for YouTube URLs + ffmpeg trim
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            from pytubefix import YouTube
+            yt = YouTube(url)
+            stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+            if stream:
+                stream.download(output_path=str(out_mp4.parent), filename="pytube_raw.mp4")
+                raw_dl = out_mp4.parent / "pytube_raw.mp4"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", start_hms, "-to", end_hms, "-i", str(raw_dl), "-c", "copy", str(out_mp4)],
+                    check=True,
+                )
+                if out_mp4.exists() and out_mp4.stat().st_size > 1024:
+                    return
+        except Exception as exc:
+            last_err = f"{last_err} | pytubefix: {exc}"
+
+    raise RuntimeError(last_err)
 
 
 DETECTORS = [
@@ -146,7 +195,7 @@ def analyze_job(job_id: str, payload: dict) -> None:
         source = payload["source"]
         is_local = bool(payload.get("is_local", False))
         clip_len = int(payload.get("clip_len", 35))
-        top_n = int(payload.get("top_n", 8))
+        top_n = int(payload.get("top_n", 10))
         cookies_text = (payload.get("cookies") or "").strip()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,37 +211,57 @@ def analyze_job(job_id: str, payload: dict) -> None:
 
             if is_local:
                 p = Path(source)
-                job["status"] = "Reading local video duration..."
+                job["status"] = "Scanning entire uploaded video..."
                 duration = get_local_duration(p)
                 title = p.name
             else:
-                job["status"] = "Fetching video info & heatmap from platform..."
-                proc = subprocess.run(
-                    ytdlp_base_cmd(cookies_path) + ["--dump-json", "--skip-download", source],
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                )
-                if proc.returncode != 0:
-                    err_msg = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()[-1]
-                    raise RuntimeError(err_msg)
-                info = json.loads(proc.stdout)
+                job["status"] = "Opening video & scanning full timeline..."
+                info = None
+                last_err = "Could not open video link"
+                for browser in get_browser_candidates():
+                    proc = subprocess.run(
+                        ytdlp_base_cmd(cookies_path, browser) + ["--dump-json", "--skip-download", source],
+                        capture_output=True,
+                        text=True,
+                        timeout=90,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        info = json.loads(proc.stdout)
+                        break
+                    if proc.stderr or proc.stdout:
+                        last_err = (proc.stderr or proc.stdout).strip().splitlines()[-1]
+
+                if info is None and ("youtube.com" in source or "youtu.be" in source):
+                    try:
+                        from pytubefix import YouTube
+                        yt = YouTube(source)
+                        info = {"title": yt.title or "YouTube Video", "duration": yt.length or 60, "heatmap": []}
+                    except Exception as exc:
+                        last_err = f"{last_err} | pytubefix: {exc}"
+
+                if info is None:
+                    raise RuntimeError(last_err)
+
                 title = info.get("title") or "Untitled Video"
                 duration = float(info.get("duration") or 60)
                 heatmap = info.get("heatmap") or []
 
-                job["status"] = "Checking transcript & live chat spikes..."
-                subprocess.run(
-                    ytdlp_base_cmd(cookies_path) + [
-                        "--skip-download", "--write-auto-subs", "--write-subs",
-                        "--sub-langs", "en,live_chat",
-                        "-o", str(tmp_dir / "meta"), source,
-                    ],
-                    check=False,
-                    timeout=60,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                job["status"] = "Analyzing full transcript & live chat spikes..."
+                for browser in get_browser_candidates():
+                    proc_sub = subprocess.run(
+                        ytdlp_base_cmd(cookies_path, browser) + [
+                            "--skip-download", "--write-auto-subs", "--write-subs",
+                            "--sub-langs", "en,live_chat",
+                            "-o", str(tmp_dir / "meta"), source,
+                        ],
+                        check=False,
+                        timeout=60,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if proc_sub.returncode == 0:
+                        break
+
                 for vtt_file in tmp_dir.glob("*.vtt"):
                     vtt_entries.extend(parse_vtt_snippets(vtt_file))
                 for chat_file in tmp_dir.glob("*.live_chat.json"):
@@ -209,7 +278,7 @@ def analyze_job(job_id: str, payload: dict) -> None:
                             except Exception:
                                 continue
 
-            job["status"] = "Scoring & ranking top viral clips..."
+            job["status"] = "Scoring & ranking top viral moments..."
             candidates = []
             max_chat = max(chat_buckets.values(), default=1)
 
@@ -297,7 +366,7 @@ def analyze_job(job_id: str, payload: dict) -> None:
                     })
 
             job["done"] = True
-            job["status"] = f"Found {len(picked)} clips!"
+            job["status"] = f"Found {len(picked)} clips across the full video!"
             job["result"] = {"title": title, "duration": duration, "duration_hms": sec_to_hms(duration), "clips": picked}
     except Exception as exc:
         job["done"] = True
@@ -373,21 +442,8 @@ def render_job(job_id: str, payload: dict) -> None:
                     check=True,
                 )
             else:
-                job["status"] = "Downloading clip section via yt-dlp..."
-                proc = subprocess.run(
-                    ytdlp_base_cmd(cookies_path) + [
-                        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-                        "--merge-output-format", "mp4",
-                        "--download-sections", f"*{start_hms}-{end_hms}",
-                        "-o", str(src_mp4),
-                        source,
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-                if proc.returncode != 0:
-                    err_msg = (proc.stderr or proc.stdout or "Download failed").strip().splitlines()[-1]
-                    raise RuntimeError(err_msg)
+                job["status"] = "Downloading clip section..."
+                robust_ytdlp_download(source, start_hms, end_hms, src_mp4, cookies_path)
 
             words = []
             try:
@@ -481,7 +537,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center font-bold text-sm">CF</div>
       <div>
         <h1 class="font-bold text-base">ClipForge Pro <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 ml-1">Unlimited • Free • No Watermark</span></h1>
-        <p class="text-[11px] text-zinc-400">YouTube, Twitch, Kick, TikTok, X, or File Upload → 1080×1920 iPhone & TikTok MP4</p>
+        <p class="text-[11px] text-zinc-400">Scans full videos from YouTube, Twitch, Kick, TikTok, X, or Upload → 1080×1920 iPhone & TikTok MP4</p>
       </div>
     </div>
   </header>
@@ -545,14 +601,6 @@ HTML_PAGE = """<!DOCTYPE html>
         <summary class="cursor-pointer hover:text-zinc-200">Optional: Paste YouTube cookies.txt (if YouTube blocks cloud IP)</summary>
         <textarea id="cookiesInput" rows="2" placeholder="Paste Netscape cookies.txt content here only if YouTube asks to sign in..." class="mt-2 w-full bg-[#181828] border border-white/10 rounded-lg p-2 text-[11px] text-zinc-200"></textarea>
       </details>
-
-      <div class="flex flex-wrap items-center gap-2 pt-2 border-t border-white/10 text-xs">
-        <span class="text-zinc-400">Custom timestamps:</span>
-        <input id="manualStart" type="text" value="00:02:25" class="w-24 bg-[#181828] border border-white/10 rounded px-2 py-1 font-mono" />
-        <span>→</span>
-        <input id="manualEnd" type="text" value="00:03:00" class="w-24 bg-[#181828] border border-white/10 rounded px-2 py-1 font-mono" />
-        <button id="manualRenderBtn" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-semibold transition">Render Custom Clip</button>
-      </div>
     </section>
 
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
@@ -562,7 +610,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <span class="text-[10px] text-zinc-400">Estimates only, not guarantees</span>
         </div>
         <div id="videoMeta" class="text-xs text-zinc-300">Paste any video link or upload a video file above.</div>
-        <div id="clipsList" class="space-y-2.5 max-h-[520px] overflow-y-auto pr-1"></div>
+        <div id="clipsList" class="space-y-2.5 max-h-[540px] overflow-y-auto pr-1"></div>
       </section>
 
       <section class="lg:col-span-6 bg-[#12121e] border border-white/10 rounded-xl p-4 flex flex-col items-center justify-center min-h-[460px] space-y-3">
@@ -690,7 +738,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function runAnalyze(source, isLocal) {
-      videoMeta.textContent = 'Starting analysis...';
+      videoMeta.textContent = 'Starting full-video scan...';
       clipsList.innerHTML = '';
       try {
         const res = await fetch('/api/analyze', {
@@ -752,10 +800,6 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (err) {
         videoMeta.textContent = 'Upload failed: ' + err.message;
       }
-    });
-
-    document.getElementById('manualRenderBtn').addEventListener('click', () => {
-      startRender(document.getElementById('manualStart').value, document.getElementById('manualEnd').value);
     });
   </script>
 </body>
@@ -826,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8"))
         if parsed.path == "/api/analyze":
             job_id = uuid.uuid4().hex
-            ANALYZE_JOBS[job_id] = {"done": False, "status": "Starting analysis..."}
+            ANALYZE_JOBS[job_id] = {"done": False, "status": "Starting full-video scan..."}
             threading.Thread(target=analyze_job, args=(job_id, body), daemon=True).start()
             self._send_json({"job_id": job_id})
         elif parsed.path == "/api/render":
@@ -844,3 +888,5 @@ if __name__ == "__main__":
     if HOST == "127.0.0.1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+
+
