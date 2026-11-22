@@ -62,7 +62,6 @@ def ytdlp_base_cmd(cookies_path: Path | None = None, browser: str | None = None)
 
 
 def get_browser_candidates() -> list[str | None]:
-    # On local PC (no PORT env), try browser cookies automatically if default fails
     if "PORT" not in os.environ:
         return [None, "edge", "chrome", "firefox"]
     return [None]
@@ -88,7 +87,6 @@ def robust_ytdlp_download(url: str, start_hms: str, end_hms: str, out_mp4: Path,
             if proc.stderr or proc.stdout:
                 last_err = (proc.stderr or proc.stdout).strip().splitlines()[-1]
 
-    # Fallback: pytubefix for YouTube URLs + ffmpeg trim
     if "youtube.com" in url or "youtu.be" in url:
         try:
             from pytubefix import YouTube
@@ -888,5 +886,4 @@ if __name__ == "__main__":
     if HOST == "127.0.0.1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
-
 
